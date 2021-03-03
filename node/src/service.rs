@@ -33,7 +33,7 @@ use sc_service::{
 	error::Error as ServiceError, Configuration, PartialComponents, Role, TFullBackend,
 	TFullClient, TaskManager,
 };
-use sp_core::{Pair, H160, H256};
+use sp_core::{Pair, H160, H256, U256};
 use sp_runtime::traits::BlakeTwo256;
 use sp_trie::PrefixedMemoryDB;
 use std::{
@@ -223,40 +223,8 @@ where
 		system_rpc_tx,
 	})?;
 
-	if let Some(filter_pool) = filter_pool {
-		const FILTER_RETAIN_THRESHOLD: u64 = 100;
-		let mut notification_st = client.import_notification_stream();
-		// Only place here where we use filter_pool, we can move the Arc instead of cloning it.
-		// let filter_pool = Arc::clone(&filter_pool);
-
-		task_manager
-			.spawn_essential_handle()
-			.spawn("frontier-filter-pool", async move {
-				while let Some(notification) = notification_st.next().await {
-					if let Ok(filter_pool) = &mut filter_pool.lock() {
-						let imported_number: u64 = notification.header.number as u64;
-						// BTreeMap::retain is unstable :c.
-						// 1. We collect all keys to remove.
-						// 2. We remove them.
-						let remove_list: Vec<_> = filter_pool
-							.iter()
-							.filter_map(|(&k, v)| {
-								let lifespan_limit = v.at_block + FILTER_RETAIN_THRESHOLD;
-								if lifespan_limit <= imported_number {
-									Some(k)
-								} else {
-									None
-								}
-							})
-							.collect();
-
-						for key in remove_list {
-							filter_pool.remove(&key);
-						}
-					}
-				}
-			});
-	}
+	// Spawn Frontier EthFilterApi maintenance task.
+	frontier_filter_pool(&client, &task_manager, filter_pool);
 
 	// Spawn Frontier pending transactions maintenance task (as essential, otherwise we leak).
 	if pending_transactions.is_some() {
@@ -522,27 +490,7 @@ pub fn new_dev(
 	})?;
 
 	// Spawn Frontier EthFilterApi maintenance task.
-	if filter_pool.is_some() {
-		// Each filter is allowed to stay in the pool for 100 blocks.
-		const FILTER_RETAIN_THRESHOLD: u64 = 100;
-		task_manager.spawn_essential_handle().spawn(
-			"frontier-filter-pool",
-			client
-				.import_notification_stream()
-				.for_each(move |notification| {
-					if let Ok(locked) = &mut filter_pool.clone().unwrap().lock() {
-						let imported_number: u64 = notification.header.number as u64;
-						for (k, v) in locked.clone().iter() {
-							let lifespan_limit = v.at_block + FILTER_RETAIN_THRESHOLD;
-							if lifespan_limit <= imported_number {
-								locked.remove(&k);
-							}
-						}
-					}
-					futures::future::ready(())
-				}),
-		);
-	}
+	frontier_filter_pool(&client, &task_manager, filter_pool);
 
 	// Spawn Frontier pending transactions maintenance task (as essential, otherwise we leak).
 	if pending_transactions.is_some() {
@@ -595,4 +543,45 @@ pub fn new_dev(
 
 	network_starter.start_network();
 	Ok(task_manager)
+}
+
+fn frontier_filter_pool(
+	client: &FullClient,
+	task_manager: &TaskManager,
+	filter_pool: Option<Arc<Mutex<BTreeMap<U256, fc_rpc_core::types::FilterPoolItem>>>>,
+) {
+	if let Some(filter_pool) = filter_pool {
+		const FILTER_RETAIN_THRESHOLD: u64 = 100;
+		let mut notification_st = client.import_notification_stream();
+		// Only place here where we use filter_pool, we can move the Arc instead of cloning it.
+		// let filter_pool = Arc::clone(&filter_pool);
+
+		task_manager
+			.spawn_essential_handle()
+			.spawn("frontier-filter-pool", async move {
+				while let Some(notification) = notification_st.next().await {
+					if let Ok(filter_pool) = &mut filter_pool.lock() {
+						let imported_number: u64 = notification.header.number as u64;
+						// BTreeMap::retain is unstable :c.
+						// 1. We collect all keys to remove.
+						// 2. We remove them.
+						let remove_list: Vec<_> = filter_pool
+							.iter()
+							.filter_map(|(&k, v)| {
+								let lifespan_limit = v.at_block + FILTER_RETAIN_THRESHOLD;
+								if lifespan_limit <= imported_number {
+									Some(k)
+								} else {
+									None
+								}
+							})
+							.collect();
+
+						for key in remove_list {
+							filter_pool.remove(&key);
+						}
+					}
+				}
+			});
+	}
 }
