@@ -15,13 +15,20 @@
 // along with Moonbeam.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{cli::Sealing, inherents::build_inherent_data_providers};
+
+use std::{
+	collections::{BTreeMap, HashMap},
+	sync::{Arc, Mutex},
+	time::Duration,
+};
+
 use async_io::Timer;
 use cumulus_network::build_block_announce_validator;
 use cumulus_service::{
 	prepare_node_config, start_collator, start_full_node, StartCollatorParams, StartFullNodeParams,
 };
 use fc_consensus::FrontierBlockImport;
-use fc_rpc_core::types::{FilterPool, PendingTransactions};
+use fc_rpc_core::types::{FilterPool, FilterPoolItem, PendingTransaction, PendingTransactions};
 use futures::{Stream, StreamExt};
 use moonbeam_runtime::{opaque::Block, RuntimeApi};
 use polkadot_primitives::v0::CollatorPair;
@@ -36,11 +43,6 @@ use sc_service::{
 use sp_core::{Pair, H160, H256, U256};
 use sp_runtime::traits::BlakeTwo256;
 use sp_trie::PrefixedMemoryDB;
-use std::{
-	collections::{BTreeMap, HashMap},
-	sync::{Arc, Mutex},
-	time::Duration,
-};
 
 // Our native executor instance.
 native_executor_instance!(
@@ -224,55 +226,12 @@ where
 	})?;
 
 	// Spawn Frontier EthFilterApi maintenance task.
+	// Only place here where we use filter_pool, we can move the Arc instead of cloning it.
 	frontier_filter_pool(&client, &task_manager, filter_pool);
 
 	// Spawn Frontier pending transactions maintenance task (as essential, otherwise we leak).
-	if pending_transactions.is_some() {
-		use fp_consensus::{ConsensusLog, FRONTIER_ENGINE_ID};
-		use sp_runtime::generic::OpaqueDigestItemId;
-
-		const TRANSACTION_RETAIN_THRESHOLD: u64 = 5;
-		task_manager.spawn_essential_handle().spawn(
-			"frontier-pending-transactions",
-			client
-				.import_notification_stream()
-				.for_each(move |notification| {
-					if let Ok(locked) = &mut pending_transactions.clone().unwrap().lock() {
-						// As pending transactions have a finite lifespan anyway
-						// we can ignore MultiplePostRuntimeLogs error checks.
-						let mut frontier_log: Option<_> = None;
-						for log in notification.header.digest.logs.iter().rev() {
-							let log = log.try_to::<ConsensusLog>(OpaqueDigestItemId::Consensus(
-								&FRONTIER_ENGINE_ID,
-							));
-							if log.is_some() {
-								frontier_log = log;
-								break;
-							}
-						}
-
-						let imported_number: u64 = notification.header.number as u64;
-
-						if let Some(ConsensusLog::EndBlock {
-							block_hash: _,
-							transaction_hashes,
-						}) = frontier_log
-						{
-							// Retain all pending transactions that were not
-							// processed in the current block.
-							locked.retain(|&k, _| !transaction_hashes.contains(&k));
-						}
-
-						locked.retain(|_, v| {
-							// Drop all the transactions that exceeded the given lifespan.
-							let lifespan_limit = v.at_block + TRANSACTION_RETAIN_THRESHOLD;
-							lifespan_limit > imported_number
-						});
-					}
-					futures::future::ready(())
-				}),
-		);
-	}
+	// Only place here where we use pending_transactions, we can move the Arc instead of cloning it.
+	frontier_pending_transactions(&client, &task_manager, pending_transactions);
 
 	let announce_block = {
 		let network = network.clone();
@@ -490,54 +449,12 @@ pub fn new_dev(
 	})?;
 
 	// Spawn Frontier EthFilterApi maintenance task.
+	// Only place here where we use filter_pool, we can move the Arc instead of cloning it.
 	frontier_filter_pool(&client, &task_manager, filter_pool);
 
 	// Spawn Frontier pending transactions maintenance task (as essential, otherwise we leak).
-	if pending_transactions.is_some() {
-		use fp_consensus::{ConsensusLog, FRONTIER_ENGINE_ID};
-		use sp_runtime::generic::OpaqueDigestItemId;
-
-		const TRANSACTION_RETAIN_THRESHOLD: u64 = 5;
-		task_manager.spawn_essential_handle().spawn(
-			"frontier-pending-transactions",
-			client
-				.import_notification_stream()
-				.for_each(move |notification| {
-					if let Ok(locked) = &mut pending_transactions.clone().unwrap().lock() {
-						// As pending transactions have a finite lifespan anyway
-						// we can ignore MultiplePostRuntimeLogs error checks.
-						let mut frontier_log: Option<_> = None;
-						for log in notification.header.digest.logs.iter().rev() {
-							let log = log.try_to::<ConsensusLog>(OpaqueDigestItemId::Consensus(
-								&FRONTIER_ENGINE_ID,
-							));
-							if log.is_some() {
-								frontier_log = log;
-								break;
-							}
-						}
-
-						let imported_number: u64 = notification.header.number as u64;
-
-						if let Some(ConsensusLog::EndBlock {
-							block_hash: _,
-							transaction_hashes,
-						}) = frontier_log
-						{
-							// Retain all pending transactions that were not
-							// processed in the current block.
-							locked.retain(|&k, _| !transaction_hashes.contains(&k));
-						}
-						locked.retain(|_, v| {
-							// Drop all the transactions that exceeded the given lifespan.
-							let lifespan_limit = v.at_block + TRANSACTION_RETAIN_THRESHOLD;
-							lifespan_limit > imported_number
-						});
-					}
-					futures::future::ready(())
-				}),
-		);
-	}
+	// Only place here where we use pending_transactions, we can move the Arc instead of cloning it.
+	frontier_pending_transactions(&client, &task_manager, pending_transactions);
 
 	log::info!("Development Service Ready");
 
@@ -548,13 +465,11 @@ pub fn new_dev(
 fn frontier_filter_pool(
 	client: &FullClient,
 	task_manager: &TaskManager,
-	filter_pool: Option<Arc<Mutex<BTreeMap<U256, fc_rpc_core::types::FilterPoolItem>>>>,
+	filter_pool: Option<Arc<Mutex<BTreeMap<U256, FilterPoolItem>>>>,
 ) {
 	if let Some(filter_pool) = filter_pool {
 		const FILTER_RETAIN_THRESHOLD: u64 = 100;
 		let mut notification_st = client.import_notification_stream();
-		// Only place here where we use filter_pool, we can move the Arc instead of cloning it.
-		// let filter_pool = Arc::clone(&filter_pool);
 
 		task_manager
 			.spawn_essential_handle()
@@ -580,6 +495,59 @@ fn frontier_filter_pool(
 						for key in remove_list {
 							filter_pool.remove(&key);
 						}
+					}
+				}
+			});
+	}
+}
+
+fn frontier_pending_transactions(
+	client: &FullClient,
+	task_manager: &TaskManager,
+	pending_transactions: Option<Arc<Mutex<HashMap<H256, PendingTransaction>>>>,
+) {
+	if let Some(pending_transactions) = pending_transactions {
+		use fp_consensus::{ConsensusLog, FRONTIER_ENGINE_ID};
+		use sp_runtime::generic::OpaqueDigestItemId;
+
+		const TRANSACTION_RETAIN_THRESHOLD: u64 = 5;
+		let mut notification_st = client.import_notification_stream();
+
+		task_manager
+			.spawn_essential_handle()
+			.spawn("frontier-pending-transactions", async move {
+				while let Some(notification) = notification_st.next().await {
+					if let Ok(mut pending_transactions) = pending_transactions.lock() {
+						// As pending transactions have a finite lifespan anyway
+						// we can ignore MultiplePostRuntimeLogs error checks.
+						let mut frontier_log: Option<_> = None;
+						for log in notification.header.digest.logs.iter().rev() {
+							let log = log.try_to::<ConsensusLog>(OpaqueDigestItemId::Consensus(
+								&FRONTIER_ENGINE_ID,
+							));
+							if log.is_some() {
+								frontier_log = log;
+								break;
+							}
+						}
+
+						let imported_number = notification.header.number as u64;
+
+						if let Some(ConsensusLog::EndBlock {
+							block_hash: _,
+							transaction_hashes,
+						}) = frontier_log
+						{
+							// Retain all pending transactions that were not
+							// processed in the current block.
+							pending_transactions.retain(|&k, _| !transaction_hashes.contains(&k));
+						}
+
+						pending_transactions.retain(|_, v| {
+							// Drop all the transactions that exceeded the given lifespan.
+							let lifespan_limit = v.at_block + TRANSACTION_RETAIN_THRESHOLD;
+							lifespan_limit > imported_number
+						});
 					}
 				}
 			});
