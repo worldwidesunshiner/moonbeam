@@ -223,27 +223,39 @@ where
 		system_rpc_tx,
 	})?;
 
-	// Spawn Frontier EthFilterApi maintenance task.
-	if filter_pool.is_some() {
-		// Each filter is allowed to stay in the pool for 100 blocks.
+	if let Some(filter_pool) = filter_pool {
 		const FILTER_RETAIN_THRESHOLD: u64 = 100;
-		task_manager.spawn_essential_handle().spawn(
-			"frontier-filter-pool",
-			client
-				.import_notification_stream()
-				.for_each(move |notification| {
-					if let Ok(locked) = &mut filter_pool.clone().unwrap().lock() {
+		let mut notification_st = client.import_notification_stream();
+		// Only place here where we use filter_pool, we can move the Arc instead of cloning it.
+		// let filter_pool = Arc::clone(&filter_pool);
+
+		task_manager
+			.spawn_essential_handle()
+			.spawn("frontier-filter-pool", async move {
+				while let Some(notification) = notification_st.next().await {
+					if let Ok(filter_pool) = &mut filter_pool.lock() {
 						let imported_number: u64 = notification.header.number as u64;
-						for (k, v) in locked.clone().iter() {
-							let lifespan_limit = v.at_block + FILTER_RETAIN_THRESHOLD;
-							if lifespan_limit <= imported_number {
-								locked.remove(&k);
-							}
+						// BTreeMap::retain is unstable :c.
+						// 1. We collect all keys to remove.
+						// 2. We remove them.
+						let remove_list: Vec<_> = filter_pool
+							.iter()
+							.filter_map(|(&k, v)| {
+								let lifespan_limit = v.at_block + FILTER_RETAIN_THRESHOLD;
+								if lifespan_limit <= imported_number {
+									Some(k)
+								} else {
+									None
+								}
+							})
+							.collect();
+
+						for key in remove_list {
+							filter_pool.remove(&key);
 						}
 					}
-					futures::future::ready(())
-				}),
-		);
+				}
+			});
 	}
 
 	// Spawn Frontier pending transactions maintenance task (as essential, otherwise we leak).
@@ -282,6 +294,7 @@ where
 							// processed in the current block.
 							locked.retain(|&k, _| !transaction_hashes.contains(&k));
 						}
+
 						locked.retain(|_, v| {
 							// Drop all the transactions that exceeded the given lifespan.
 							let lifespan_limit = v.at_block + TRANSACTION_RETAIN_THRESHOLD;
