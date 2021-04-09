@@ -155,14 +155,14 @@ where
 
 							let mut touched_blocks = vec![];
 							let res = Self::handle_request(
-								&client,
-								&backend,
+								client.clone(),
+								backend.clone(),
 								&mut cached_blocks,
 								&mut touched_blocks,
 								req,
 								max_count,
 								cache_duration,
-							);
+							).await;
 
 							expiration_futures.push(async move {
 								delay_for(cache_duration).await;
@@ -222,17 +222,17 @@ where
 		}
 	}
 
-	fn handle_request(
-		client: &C,
-		backend: &BE,
+	async fn handle_request(
+		client: Arc<C>,
+		backend: Arc<BE>,
 		cached_blocks: &mut BTreeMap<H256, CacheBlock>,
 		touched_blocks: &mut Vec<H256>,
 		req: FilterRequest,
 		max_count: u32,
 		cache_duration: Duration,
 	) -> Result<Vec<TransactionTrace>> {
-		let from_block = Self::block_id(client, req.from_block)?;
-		let to_block = Self::block_id(client, req.to_block)?;
+		let from_block = Self::block_id(&client, req.from_block)?;
+		let to_block = Self::block_id(&client, req.to_block)?;
 
 		let count = req.count.unwrap_or(max_count);
 
@@ -257,7 +257,6 @@ where
 				continue; // no traces for genesis block.
 			}
 
-			let api = client.runtime_api();
 			let block_id = BlockId::<B>::Number(block_height);
 			let block_header = client
 				.header(block_id)
@@ -285,7 +284,19 @@ where
 				Entry::Vacant(entry) => {
 					tracing::trace!(block_height, %block_hash, "Cache miss, replaying block ...");
 
-					let traces = Self::cache_block(&backend, api, &block_header)?;
+					let backend = backend.clone();
+					let client = client.clone();
+
+					let traces = tokio::task::spawn_blocking(move || {
+						Self::cache_block(client, backend, block_header)
+					})
+					.await
+					.map_err(|e| {
+						internal_err(format!(
+							"Panicked when replaying block {} : {:?}",
+							block_height, e
+						))
+					})??;
 
 					entry.insert(CacheBlock {
 						traces,
@@ -351,10 +362,12 @@ where
 	}
 
 	fn cache_block(
-		backend: &BE,
-		api: ApiRef<C::Api>,
-		block_header: &B::Header,
+		client: Arc<C>,
+		backend: Arc<BE>,
+		block_header: B::Header,
 	) -> Result<Vec<TransactionTrace>> {
+		let api = client.runtime_api();
+
 		let height = *block_header.number();
 		let substrate_hash = block_header.hash();
 		let substrate_block_id = BlockId::Hash(substrate_hash);
