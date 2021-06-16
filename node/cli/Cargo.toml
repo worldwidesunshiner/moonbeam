@@ -16,7 +16,7 @@ sc-tracing = { git = "https://github.com/paritytech/substrate", branch = "polkad
 sp-runtime = { git = "https://github.com/paritytech/substrate", branch = "polkadot-v0.9.4" }
 sc-telemetry = { git = "https://github.com/paritytech/substrate", branch = "polkadot-v0.9.4" }
 frame-benchmarking-cli = { git = "https://github.com/paritytech/substrate", branch = "polkadot-v0.9.4" }
-try-runtime-cli = { git = "https://github.com/paritytech/substrate", branch = "polkadot-v0.9.4" }
+try-runtime-cli = { git = "https://github.com/paritytech/substrate", branch = "polkadot-v0.9.4", optional = true }
 
 cumulus-client-cli = { git = "https://github.com/purestake/cumulus", branch = "nimbus-polkadot-v0.9.4" }
 cumulus-client-service = { git = "https://github.com/purestake/cumulus", branch = "nimbus-polkadot-v0.9.4" }
@@ -38,3 +38,4 @@ substrate-build-script-utils = { git = "https://github.com/paritytech/substrate"
 default = [ "wasmtime" ]
 wasmtime = [ "sc-cli/wasmtime" ]
 runtime-benchmarks = [ "service/runtime-benchmarks" ]
+try-runtime = [ "try-runtime-cli" ]
