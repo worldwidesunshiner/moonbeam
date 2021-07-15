@@ -167,7 +167,7 @@ jobs:
       - name: Build Node
         run: |
           env
-          cargo build --release --all
+          SCCACHE_RECACHE=yes cargo build --release --all
       - name: Verify node version
         run: |
           GIT_COMMIT=`git log -1 --format="%H" | cut -c1-7`
